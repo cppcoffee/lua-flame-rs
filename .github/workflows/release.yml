@@ -59,7 +59,7 @@ jobs:
             zlib1g-dev
           sudo apt-get install -y --no-install-recommends "linux-tools-$(uname -r)" || \
             sudo apt-get install -y --no-install-recommends linux-tools-generic || \
-            echo "::warning::bpftool package install failed; using checked-in bpf/vmlinux.h"
+            echo "::warning::bpftool package install failed; the BTF step will validate whether fallback is safe"
 
       - name: Prepare musl argp shim
         run: |
@@ -165,8 +165,11 @@ jobs:
           if [ -n "$bpftool_bin" ] && [ -r /sys/kernel/btf/vmlinux ]; then
             "$bpftool_bin" btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h.tmp
             mv bpf/vmlinux.h.tmp bpf/vmlinux.h
+          elif [ "${{ matrix.arch }}" = "aarch64" ]; then
+            echo "::error::aarch64 release requires bpftool and readable /sys/kernel/btf/vmlinux; the checked-in header is x86_64-only"
+            exit 1
           else
-            echo "::warning::bpftool or /sys/kernel/btf/vmlinux unavailable; using checked-in bpf/vmlinux.h"
+            echo "::warning::bpftool or /sys/kernel/btf/vmlinux unavailable; using checked-in x86_64 bpf/vmlinux.h"
           fi
 
       - name: Install Rust toolchain
@@ -182,12 +185,16 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.rust_target }}
 
-      - name: Verify static linkage
+      - name: Verify release binary
         shell: bash
         run: |
           set -euo pipefail
           binary="target/${{ matrix.rust_target }}/release/lua-flame-rs"
           file "$binary"
+          case "${{ matrix.arch }}" in
+            x86_64) readelf -h "$binary" | grep -q 'Machine:.*Advanced Micro Devices X86-64' ;;
+            aarch64) readelf -h "$binary" | grep -q 'Machine:.*AArch64' ;;
+          esac
           if readelf -l "$binary" | grep -q ' INTERP '; then
             echo "::error::$binary contains a dynamic interpreter"
             exit 1
@@ -196,6 +203,7 @@ jobs:
             echo "::error::$binary contains dynamic dependencies"
             exit 1
           fi
+          "$binary" --help >/dev/null
 
       - name: Package release artifact
         shell: bash
