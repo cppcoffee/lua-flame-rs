@@ -1,0 +1,7 @@
+*.tmp
+*.o
+target/
+folded.txt
+folded.svg
+mixed.txt
+mixed.svg

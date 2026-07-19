@@ -1,0 +1,243 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
+  ac_cv_search_argp_parse: none required
+  ac_cv_search__obstack_free: none required
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+
+    steps:
+      - name: Checkout lua-flame-rs
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf \
+            automake \
+            autopoint \
+            binutils \
+            bison \
+            build-essential \
+            clang \
+            file \
+            flex \
+            gawk \
+            libelf-dev \
+            linux-libc-dev \
+            linux-tools-common \
+            llvm \
+            musl-tools \
+            pkg-config \
+            zlib1g-dev
+          sudo apt-get install -y --no-install-recommends "linux-tools-$(uname -r)" || \
+            sudo apt-get install -y --no-install-recommends linux-tools-generic || \
+            echo "::warning::bpftool package install failed; using checked-in bpf/vmlinux.h"
+
+      - name: Prepare musl argp shim
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/musl-argp"
+          cat > "$RUNNER_TEMP/musl-argp/argp.h" <<'EOF'
+          #ifndef LUA_FLAME_RS_MUSL_ARGP_H
+          #define LUA_FLAME_RS_MUSL_ARGP_H
+
+          #include <errno.h>
+          #include <stdio.h>
+
+          #ifndef __error_t_defined
+          #define __error_t_defined 1
+          typedef int error_t;
+          #endif
+
+          struct argp_option {
+            const char *name;
+            int key;
+            const char *arg;
+            int flags;
+            const char *doc;
+            int group;
+          };
+
+          struct argp_state {
+            const char *name;
+          };
+
+          struct argp_child {
+            const struct argp *argp;
+            int flags;
+            const char *header;
+            int group;
+          };
+
+          struct argp {
+            const struct argp_option *options;
+            error_t (*parser)(int key, char *arg, struct argp_state *state);
+            const char *args_doc;
+            const char *doc;
+            const struct argp_child *children;
+            char *(*help_filter)(int key, const char *text, void *input);
+            const char *argp_domain;
+          };
+
+          #define OPTION_ARG_OPTIONAL 0x1
+          #define ARGP_ERR_UNKNOWN E2BIG
+          #define ARGP_HELP_SEE 0x04
+
+          static inline void argp_help(const struct argp *argp, FILE *stream,
+                                       unsigned flags, char *name)
+          {
+            (void)argp;
+            (void)stream;
+            (void)flags;
+            (void)name;
+          }
+
+          #endif
+          EOF
+
+          rust_target="${{ matrix.rust_target }}"
+          cflags_name="CFLAGS_${rust_target//-/_}"
+          multiarch="$(gcc -print-multiarch 2>/dev/null || true)"
+          cflags="-I$RUNNER_TEMP/musl-argp"
+          if [ -n "$multiarch" ] && [ -d "/usr/include/$multiarch" ]; then
+            cflags="$cflags -idirafter /usr/include/$multiarch"
+          fi
+          cflags="$cflags -idirafter /usr/include"
+          if [ "$rust_target" = "aarch64-unknown-linux-musl" ]; then
+            cflags="$cflags -mno-outline-atomics"
+          fi
+          echo "${cflags_name}=$cflags" >> "$GITHUB_ENV"
+
+      - name: Regenerate architecture BTF header
+        run: |
+          set -euo pipefail
+          bpftool_bin=""
+          if command -v bpftool >/dev/null 2>&1; then
+            candidate="$(command -v bpftool)"
+            if "$candidate" version >/dev/null 2>&1; then
+              bpftool_bin="$candidate"
+            fi
+          fi
+
+          if [ -z "$bpftool_bin" ]; then
+            search_dirs=()
+            for dir in /usr/lib/linux-tools /usr/lib/linux-tools-*; do
+              [ -e "$dir" ] && search_dirs+=("$dir")
+            done
+            if [ "${#search_dirs[@]}" -gt 0 ]; then
+              while IFS= read -r candidate; do
+                if [ -x "$candidate" ] && "$candidate" version >/dev/null 2>&1; then
+                  bpftool_bin="$candidate"
+                  break
+                fi
+              done < <(find "${search_dirs[@]}" \( -type f -o -type l \) -name bpftool 2>/dev/null | sort -V)
+            fi
+          fi
+
+          if [ -n "$bpftool_bin" ] && [ -r /sys/kernel/btf/vmlinux ]; then
+            "$bpftool_bin" btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h.tmp
+            mv bpf/vmlinux.h.tmp bpf/vmlinux.h
+          else
+            echo "::warning::bpftool or /sys/kernel/btf/vmlinux unavailable; using checked-in bpf/vmlinux.h"
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.rust_target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.rust_target }}
+
+      - name: Verify static linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.rust_target }}/release/lua-flame-rs"
+          file "$binary"
+          if readelf -l "$binary" | grep -q ' INTERP '; then
+            echo "::error::$binary contains a dynamic interpreter"
+            exit 1
+          fi
+          if readelf -d "$binary" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "::error::$binary contains dynamic dependencies"
+            exit 1
+          fi
+
+      - name: Package release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME//\//-}"
+          package="lua-flame-rs-${version}-${{ matrix.rust_target }}"
+          mkdir -p "dist/${package}"
+          cp "target/${{ matrix.rust_target }}/release/lua-flame-rs" "dist/${package}/"
+          cp README.md LICENSE "dist/${package}/"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          sha256sum "dist/${package}.tar.gz" > "dist/${package}.tar.gz.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lua-flame-rs-${{ matrix.rust_target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes
+          fi

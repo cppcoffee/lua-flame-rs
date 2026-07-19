@@ -1,0 +1,29 @@
+[package]
+name = "lua-flame-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "eBPF-based Lua flame graph profiler (Rust user space)"
+license = "MIT"
+
+[[bin]]
+name = "lua-flame-rs"
+path = "src/main.rs"
+
+[dependencies]
+libbpf-rs    = { version = "0.24", features = ["vendored"] }
+libc         = "0.2"
+clap         = { version = "4.5", features = ["derive"] }
+blazesym     = "0.2"
+inferno      = { version = "0.11", default-features = false }
+anyhow       = "1"
+plain        = "0.2"
+framehop     = { version = "0.15.0", default-features = false, features = ["std"] }
+object       = { version = "0.39.1", default-features = false, features = ["read_core", "elf", "std"] }
+
+[build-dependencies]
+libbpf-cargo = "0.24"
+
+[profile.release]
+lto = true
+strip = true

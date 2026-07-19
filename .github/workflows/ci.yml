@@ -1,0 +1,253 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout lua-flame-rs
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            libbpf-dev \
+            libelf-dev \
+            liblua5.4-dev \
+            linux-tools-common \
+            llvm \
+            pkg-config \
+            zlib1g-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Build release
+        run: cargo build --locked --release
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lua-flame-rs-${{ runner.os }}-${{ runner.arch }}
+          path: target/release/lua-flame-rs
+          if-no-files-found: error
+
+  e2e:
+    name: E2E (lua ${{ matrix.lua }}, ${{ matrix.linkage }})
+    runs-on: ubuntu-24.04
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        # Cover every supported minor version × dynamic/static linkage so a
+        # regression in any of the six combinations surfaces here, not in the
+        # field. Static linkage also exercises auto-discovery against the
+        # main executable (no liblua5.X.so in /proc/<pid>/maps).
+        lua: ["5.2", "5.3", "5.4"]
+        linkage: ["dynamic", "static"]
+    steps:
+      - name: Checkout lua-flame-rs
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            liblua${{ matrix.lua }}-dev \
+            curl
+
+      - name: Build test harness (dynamic)
+        if: matrix.linkage == 'dynamic'
+        run: |
+          cc -O2 tests/harness.c -o /tmp/lua-harness \
+            -I/usr/include/lua${{ matrix.lua }} \
+            -llua${{ matrix.lua }} -lm -ldl \
+            -Wl,-rpath=/usr/lib/x86_64-linux-gnu
+          ldd /tmp/lua-harness
+          # Sanity: it actually runs.
+          LUA_FLAME_RS_HARNESS_ITERS=1 \
+            LUA_FLAME_RS_WORK_ITERS=10 \
+            /tmp/lua-harness "$GITHUB_WORKSPACE/tests/cpu-burn.lua"
+
+      - name: Build test harness (static)
+        if: matrix.linkage == 'static'
+        run: |
+          # Statically link Lua against the harness. Statically linked
+          # binaries are also the case where auto-discovery has to fall
+          # back to /proc/<pid>/exe (no liblua5.X.so appears in maps), so
+          # this exercises that path too.
+          case "${{ matrix.lua }}" in
+            5.2) v=5.2.4; src=lua-5.2.4 ;;
+            5.3) v=5.3.6; src=lua-5.3.6 ;;
+            5.4) v=5.4.8; src=lua-5.4.8 ;;
+          esac
+          curl -sSLO "https://www.lua.org/ftp/lua-$v.tar.gz"
+          tar xzf "lua-$v.tar.gz"
+          make -C "$src/src" -j"$(nproc)" MYCFLAGS="-fPIC" a CC=gcc
+          cc -O2 tests/harness.c \
+            -I"$src/src" \
+            "$src/src/liblua.a" \
+            -o /tmp/lua-harness -lm -ldl -Wl,--gc-sections -ffunction-sections
+          # At least one Lua entry point must survive the link for us to
+          # uprobe (we require lua_resume / lua_pcallk / lua_callk).
+          nm /tmp/lua-harness | grep -E ' T (lua_resume|lua_pcallk|lua_callk)$' \
+            || { echo "::error::no Lua entry-point symbol in static binary"; exit 1; }
+          # Sanity: it actually runs.
+          LUA_FLAME_RS_HARNESS_ITERS=1 \
+            LUA_FLAME_RS_WORK_ITERS=10 \
+            /tmp/lua-harness "$GITHUB_WORKSPACE/tests/cpu-burn.lua"
+
+      - name: Download profiler binary
+        uses: actions/download-artifact@v4
+        with:
+          name: lua-flame-rs-${{ runner.os }}-${{ runner.arch }}
+          path: dist-bin
+
+      - name: Preflight kernel checks
+        run: |
+          uname -a
+          cat /proc/sys/kernel/perf_event_paranoid
+          sudo test -r /sys/kernel/btf/vmlinux
+          chmod +x dist-bin/lua-flame-rs
+
+      - name: Start interpreter workload
+        run: |
+          /tmp/lua-harness "$GITHUB_WORKSPACE/tests/cpu-burn.lua" > /tmp/harness.log 2>&1 &
+          echo "HPID=$!" >> "$GITHUB_ENV"
+
+      - name: Profile Lua frames
+        run: |
+          sleep 1
+          if ! kill -0 "$HPID" 2>/dev/null; then
+            echo "::error::Lua workload exited before profiling"
+            cat /tmp/harness.log
+            exit 1
+          fi
+          sudo ./dist-bin/lua-flame-rs -p "$HPID" -d 5 -o folded.txt 2>&1 | tee /tmp/lua-only.log
+
+      - name: Verify Lua-only output
+        run: |
+          ls -l folded.txt folded.svg || true
+          echo '--- folded.txt ---'
+          cat folded.txt 2>/dev/null || true
+          if ! test -s folded.txt; then
+            echo "::error::folded.txt is missing or empty"
+            exit 1
+          fi
+          if ! test -s folded.svg; then
+            echo "::error::folded.svg is missing or empty"
+            exit 1
+          fi
+          if ! grep -q 'L:.*cpu-burn' folded.txt; then
+            echo "::error::folded.txt contains no cpu-burn Lua frame"
+            exit 1
+          fi
+          # Lua-only must NOT contain any C frames. Regression guard for the
+          # lua_frames_only BPF flag and the user-space backstop.
+          if grep -q 'C:' folded.txt; then
+            echo "::error::Lua-only output unexpectedly contains C frames"
+            exit 1
+          fi
+
+      - name: Profile mixed C + Lua frames
+        run: sudo ./dist-bin/lua-flame-rs -p "$HPID" --include-c-stacks -d 5 -o mixed.txt 2>&1 | tee /tmp/mixed.log
+
+      - name: Verify mixed output
+        run: |
+          test -s mixed.txt
+          test -s mixed.svg
+          grep -q 'L:.*cpu-burn' mixed.txt
+          grep -q 'user-space DWARF unwind' /tmp/mixed.log
+          # mixed mode MUST surface native frames — any C symbol renders as
+          # `name+0xNNN`. Without this assertion a regression that silently
+          # dropped native symbolization would look identical to Lua-only
+          # output and slip past CI.
+          if ! grep -Eq '[a-z_][a-z_0-9]*\+0x[0-9a-f]+' mixed.txt; then
+            echo "::error::mixed output contains no native symbol frames"
+            echo '--- mixed.txt ---'
+            cat mixed.txt
+            exit 1
+          fi
+
+      - name: Upload E2E diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ matrix.lua }}-${{ matrix.linkage }}-${{ github.run_attempt }}
+          path: |
+            folded.txt
+            folded.svg
+            mixed.txt
+            mixed.svg
+            /tmp/lua-only.log
+            /tmp/mixed.log
+            /tmp/harness.log
+          if-no-files-found: warn
+
+      - name: Stop workload
+        if: always()
+        run: |
+          kill "$HPID" 2>/dev/null || true
+          echo '--- harness.log ---'
+          cat /tmp/harness.log 2>/dev/null || true
+
+  offsets:
+    name: Offset table vs upstream Lua headers
+    runs-on: ubuntu-24.04
+    # Independent of the Rust build — fast feedback on the version-specific
+    # offset tables (WalkerOffsets, ProtoLayout) against the *real* Lua
+    # headers. Without this job the Rust unit tests can only prove the
+    # tables match themselves, not that they match Lua.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { lua: "5.2.3", short: "52" }
+          - { lua: "5.3.6", short: "53" }
+          - { lua: "5.4.8", short: "54" }
+    steps:
+      - name: Checkout lua-flame-rs
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential curl
+
+      - name: Fetch upstream Lua source
+        run: |
+          curl -sSLO "https://www.lua.org/ftp/lua-${{ matrix.lua }}.tar.gz"
+          tar xzf "lua-${{ matrix.lua }}.tar.gz"
+
+      - name: Compile + run offsets.c
+        run: |
+          cc -I"lua-${{ matrix.lua }}/src" tests/offsets.c -o /tmp/offsets-${{ matrix.short }}
+          /tmp/offsets-${{ matrix.short }} | tee /tmp/offsets.log
+          # Non-zero exit if any CHECK failed.
+          grep -q '0 failures' /tmp/offsets.log
