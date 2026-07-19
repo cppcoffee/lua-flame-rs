@@ -52,14 +52,10 @@ jobs:
             gawk \
             libelf-dev \
             linux-libc-dev \
-            linux-tools-common \
             llvm \
             musl-tools \
             pkg-config \
             zlib1g-dev
-          sudo apt-get install -y --no-install-recommends "linux-tools-$(uname -r)" || \
-            sudo apt-get install -y --no-install-recommends linux-tools-generic || \
-            echo "::warning::bpftool package install failed; the BTF step will validate whether fallback is safe"
 
       - name: Prepare musl argp shim
         run: |
@@ -136,41 +132,7 @@ jobs:
           fi
           echo "${cflags_name}=$cflags" >> "$GITHUB_ENV"
 
-      - name: Regenerate architecture BTF header
-        run: |
-          set -euo pipefail
-          bpftool_bin=""
-          if command -v bpftool >/dev/null 2>&1; then
-            candidate="$(command -v bpftool)"
-            if "$candidate" version >/dev/null 2>&1; then
-              bpftool_bin="$candidate"
-            fi
-          fi
 
-          if [ -z "$bpftool_bin" ]; then
-            search_dirs=()
-            for dir in /usr/lib/linux-tools /usr/lib/linux-tools-*; do
-              [ -e "$dir" ] && search_dirs+=("$dir")
-            done
-            if [ "${#search_dirs[@]}" -gt 0 ]; then
-              while IFS= read -r candidate; do
-                if [ -x "$candidate" ] && "$candidate" version >/dev/null 2>&1; then
-                  bpftool_bin="$candidate"
-                  break
-                fi
-              done < <(find "${search_dirs[@]}" \( -type f -o -type l \) -name bpftool 2>/dev/null | sort -V)
-            fi
-          fi
-
-          if [ -n "$bpftool_bin" ] && [ -r /sys/kernel/btf/vmlinux ]; then
-            "$bpftool_bin" btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h.tmp
-            mv bpf/vmlinux.h.tmp bpf/vmlinux.h
-          elif [ "${{ matrix.arch }}" = "aarch64" ]; then
-            echo "::error::aarch64 release requires bpftool and readable /sys/kernel/btf/vmlinux; the checked-in header is x86_64-only"
-            exit 1
-          else
-            echo "::warning::bpftool or /sys/kernel/btf/vmlinux unavailable; using checked-in x86_64 bpf/vmlinux.h"
-          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

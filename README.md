@@ -105,12 +105,10 @@ The resulting binary is `target/release/lua-flame-rs`.
 
 ### aarch64
 
-Before building on aarch64, install `bpftool` and regenerate `bpf/vmlinux.h`
-from the build machine's kernel BTF:
+The build script automatically selects the checked-in minimal arm64 BPF UAPI
+header at `bpf/arm64/vmlinux.h`, so no build-host BTF or `bpftool` is required:
 
 ```sh
-bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h.tmp
-mv bpf/vmlinux.h.tmp bpf/vmlinux.h
 cargo build --locked --release
 ```
 

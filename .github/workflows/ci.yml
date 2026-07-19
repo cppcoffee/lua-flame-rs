@@ -49,6 +49,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check arm64 BPF build
+        run: |
+          multiarch="$(gcc -print-multiarch)"
+          clang -g -O2 -target bpf -D__TARGET_ARCH_arm64 \
+            -I"/usr/include/$multiarch" -Ibpf/arm64 -Ibpf \
+            -c bpf/profile.bpf.c -o /tmp/profile-arm64.bpf.o
+          test -s /tmp/profile-arm64.bpf.o
+
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
