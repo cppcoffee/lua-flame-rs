@@ -86,7 +86,8 @@ and the native C development toolchain used by `libbpf`.
 Install the build dependencies on Debian/Ubuntu with:
 
 ```sh
-sudo apt install build-essential clang llvm pkg-config \
+sudo apt install autoconf automake autopoint bison flex gawk \
+  build-essential clang llvm pkg-config \
   libelf-dev libbpf-dev zlib1g-dev \
   liblua5.4-dev        # or liblua5.3-dev / liblua5.2-dev for the demo workload
 ```
