@@ -77,7 +77,6 @@ The version is read from `LUA_VERSION_NUM` in `lua.h` — no `-D` flag needed.
 | `callstatus_mask`      | 0xffff | 0xffff | 0xff | width mask |
 | `lua_frame_mask`       | 0x2  | 0x2  | 0x1  | see semantics below |
 | `lua_frame_when_set`   | 0    | 1    | 1    | see semantics below |
-| `proto_code`           | 64   | 56   | 24   | |
 | `proto_linedefined`    | 44   | 40   | 104  | |
 | `proto_source`         | 112  | 104  | 72   | `TString.contents` is at +24 in all three |
 

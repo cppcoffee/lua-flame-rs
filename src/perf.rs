@@ -34,13 +34,13 @@ struct PerfEventAttr {
 }
 
 /// Open a per-CPU software CPU-clock event at the requested frequency.
-pub fn open_cpu_clock(freq: u64, cpu: i32, exclude_kernel: bool) -> Result<c_int> {
+pub fn open_cpu_clock(freq: u64, cpu: i32) -> Result<c_int> {
     let attr = PerfEventAttr {
         type_: PERF_TYPE_SOFTWARE,
         size: std::mem::size_of::<PerfEventAttr>() as u32,
         config: PERF_COUNT_SW_CPU_CLOCK,
         sample_period_or_freq: freq,
-        flags: (1u64 << 10) | (u64::from(exclude_kernel) << 5),
+        flags: (1u64 << 10) | (1u64 << 5), // freq | exclude_kernel
         ..Default::default()
     };
 

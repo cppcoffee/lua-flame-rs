@@ -185,7 +185,7 @@ jobs:
             exit 1
           fi
           # Lua-only must NOT contain any C frames. Regression guard for the
-          # lua_frames_only BPF flag and the user-space backstop.
+          # collect_native_stacks BPF gate and the user-space backstop.
           if grep -q 'C:' folded.txt; then
             echo "::error::Lua-only output unexpectedly contains C frames"
             exit 1

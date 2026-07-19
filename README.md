@@ -121,7 +121,7 @@ libbpf skeleton at compile time through `libbpf-cargo`.
 target process (lua5.X / liblua5.X.so embedder)
    |
    |  uprobe on lua_resume / lua_pcallk / lua_callk   -> capture lua_State* per tid
-   |  uretprobe on lua_resume/lua_pcallk/lua_callk/lua_yieldk  -> drop lua_State* per tid
+   |  uretprobe on lua_resume / lua_pcallk / lua_callk  -> drop lua_State* per tid
    |  perf-event CPU clock @ N Hz         -> on each sample:
    |      - registers + user stack bytes  -> offline native unwind input
    |      - bpf_get_stack()               -> fallback native IPs
@@ -131,7 +131,7 @@ target process (lua5.X / liblua5.X.so embedder)
 +----------------------------------------------------------+
 | Rust user space                                          |
 |   libbpf-rs  : load skeleton, attach uprobe/perf-event   |
-|   object     : find lua_resume/pcallk/callk/yieldk ELF   |
+|   object     : find lua_resume/pcallk/callk ELF          |
 |                offsets + detect Lua version              |
 |   framehop   : unwind native frames from ELF DWARF CFI   |
 |   blazesym   : resolve native IPs -> C symbol names      |
@@ -254,10 +254,9 @@ per-instruction lines.
   verifier complexity manageable.
 - The Lua 5.4 line resolver walks `Proto->lineinfo` forward from pc 0, bounded
   by `sizelineinfo`; very large functions pay an O(pc) cost per sample.
-- `lua_pcallk` / `lua_callk` / `lua_yieldk` are looked up best-effort: at
-  least one of `lua_resume` / `lua_pcallk` / `lua_callk` must be present to
-  attach; whichever are missing degrade coroutine yield-aware re-entrancy
-  tracking.
+- `lua_pcallk` / `lua_callk` are looked up best-effort: at least one of
+  `lua_resume` / `lua_pcallk` / `lua_callk` must be present to attach;
+  whichever are missing degrades C API re-entrancy tracking.
 - **Stripped / statically linked targets**: version detection falls back to
   the file-name substring, and finally to `--lua-version`. If the binary is
   fully stripped of *all* of `lua_resume` / `lua_pcallk` / `lua_callk`, there

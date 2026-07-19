@@ -22,14 +22,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lineresolve::{LineResolver, ProtoLayout};
-use syms::LuaVersion;
+use syms::{LuaModule, LuaVersion};
 use types::{LuaStackEvent, NativeEvent, SampleKey, FUNC_TYPE_C, FUNC_TYPE_LCF, FUNC_TYPE_LUA};
 use unwind::{NativeSample, UserUnwinder};
 
 mod profile {
     include!(concat!(env!("OUT_DIR"), "/profile.skel.rs"));
 }
-use profile::ProfileSkelBuilder;
+use profile::{ProfileSkel, ProfileSkelBuilder};
 
 #[derive(Parser, Debug)]
 #[command(version, about = "eBPF-based Lua 5.2/5.3/5.4 flame graph profiler")]
@@ -73,7 +73,6 @@ struct WalkerOffsets {
     callstatus_mask: u32,
     lua_frame_mask: u32,
     lua_frame_when_set: u32,
-    proto_code: u32,
     proto_linedefined: u32,
     proto_source: u32,
 }
@@ -88,7 +87,6 @@ fn walker_offsets(v: LuaVersion) -> WalkerOffsets {
             callstatus_mask: 0xffff,
             lua_frame_mask: 0x2,
             lua_frame_when_set: 0,
-            proto_code: 64,
             proto_linedefined: 44,
             proto_source: 112,
         },
@@ -101,7 +99,6 @@ fn walker_offsets(v: LuaVersion) -> WalkerOffsets {
             callstatus_mask: 0xffff,
             lua_frame_mask: 0x2,
             lua_frame_when_set: 1,
-            proto_code: 56,
             proto_linedefined: 40,
             proto_source: 104,
         },
@@ -113,7 +110,6 @@ fn walker_offsets(v: LuaVersion) -> WalkerOffsets {
             callstatus_mask: 0xff,
             lua_frame_mask: 0x1,
             lua_frame_when_set: 1,
-            proto_code: 24,
             proto_linedefined: 104,
             proto_source: 72,
         },
@@ -174,61 +170,102 @@ fn main() -> Result<()> {
         .with_context(|| format!("locating lua runtime for pid {}", args.pid))?;
     let offs = module.offsets;
     println!(
-        "[+] pid {} -> {} (Lua {})\n    lua_resume={:#x} lua_pcallk={:#x} lua_callk={:#x} lua_yieldk={:#x}",
+        "[+] pid {} -> {} (Lua {})\n    lua_resume={:#x} lua_pcallk={:#x} lua_callk={:#x}",
         args.pid,
         module.path.display(),
         module.version.as_str(),
         offs.lua_resume,
         offs.lua_pcallk,
-        offs.lua_callk,
-        offs.lua_yieldk
+        offs.lua_callk
     );
 
-    let user_unwinder = if include_native_stacks {
-        match UserUnwinder::new(args.pid) {
-            Ok(unwinder) => {
-                println!(
-                    "[+] loaded DWARF unwind data for {} native modules",
-                    unwinder.module_count()
-                );
-                Some(unwinder)
-            }
-            Err(error) => {
-                eprintln!(
-                    "[!] user-space DWARF unwinder unavailable: {error:#}; using bpf_get_stack fallback"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let user_unwinder = create_user_unwinder(args.pid, include_native_stacks);
 
     bump_memlock_rlimit()?;
 
     let mut object = MaybeUninit::<libbpf_rs::OpenObject>::uninit();
-    let open_skel = ProfileSkelBuilder::default().open(&mut object)?;
-    open_skel.maps.rodata_data.targ_pid = args.pid;
-    open_skel.maps.rodata_data.targ_tid = -1;
+    let skel = load_bpf(&mut object, args.pid, include_native_stacks, module.version)?;
+
+    let links = attach_lua_probes(&skel, &module)?;
+    let perf_links = attach_perf_events(&skel, args.frequency)?;
+
+    let pending = Arc::new(Mutex::new(Pending::default()));
+    let (pb_native, pb_lua) =
+        build_perf_buffers(&skel, &pending, user_unwinder, include_native_stacks)?;
+
+    let mut processor =
+        SampleProcessor::new(pending, args.pid, module.version, include_native_stacks);
+    let poll_result = capture_samples(
+        &pb_native,
+        &pb_lua,
+        args.frequency,
+        args.duration,
+        &mut processor,
+    );
+    drop(pb_native);
+    drop(pb_lua);
+
+    processor.finish();
+    let folded = processor.take_folded();
+    write_capture_outputs(
+        &folded,
+        std::path::Path::new(&args.output),
+        module.version,
+        include_native_stacks,
+    )?;
+
+    drop(links);
+    drop(perf_links);
+    poll_result
+}
+
+fn create_user_unwinder(pid: i32, include_native_stacks: bool) -> Option<UserUnwinder> {
+    if !include_native_stacks {
+        return None;
+    }
+    match UserUnwinder::new(pid) {
+        Ok(unwinder) => {
+            println!(
+                "[+] loaded DWARF unwind data for {} native modules",
+                unwinder.module_count()
+            );
+            Some(unwinder)
+        }
+        Err(error) => {
+            eprintln!(
+                "[!] user-space DWARF unwinder unavailable: {error:#}; using bpf_get_stack fallback"
+            );
+            None
+        }
+    }
+}
+
+fn load_bpf<'obj>(
+    object: &'obj mut MaybeUninit<libbpf_rs::OpenObject>,
+    pid: i32,
+    include_native_stacks: bool,
+    version: LuaVersion,
+) -> Result<ProfileSkel<'obj>> {
+    let open_skel = ProfileSkelBuilder::default().open(object)?;
+    open_skel.maps.rodata_data.targ_pid = pid;
     open_skel.maps.rodata_data.collect_native_stacks = include_native_stacks;
-    open_skel.maps.rodata_data.lua_frames_only = !include_native_stacks;
-    let w = walker_offsets(module.version);
+    let w = walker_offsets(version);
     open_skel.maps.rodata_data.loff_state_ci = w.state_ci;
     open_skel.maps.rodata_data.loff_ci_savedpc = w.ci_savedpc;
     open_skel.maps.rodata_data.loff_ci_callstatus = w.ci_callstatus;
     open_skel.maps.rodata_data.loff_callstatus_mask = w.callstatus_mask;
     open_skel.maps.rodata_data.loff_lua_frame_mask = w.lua_frame_mask;
     open_skel.maps.rodata_data.loff_lua_frame_when_set = w.lua_frame_when_set;
-    open_skel.maps.rodata_data.loff_proto_code = w.proto_code;
     open_skel.maps.rodata_data.loff_proto_linedefined = w.proto_linedefined;
     open_skel.maps.rodata_data.loff_proto_source = w.proto_source;
-    let skel = open_skel.load()?;
+    Ok(open_skel.load()?)
+}
 
-    // uprobes on whichever Lua entry points this build exports. lua_resume is
-    // preferred (it's what drives coroutine resume); pcallk and callk are
-    // attached opportunistically so statically-linked + LTO-gc'd binaries
-    // that dropped resume but kept pcallk still profile correctly.
-    let mut links: Vec<libbpf_rs::Link> = Vec::new();
+fn attach_lua_probes(skel: &ProfileSkel<'_>, module: &LuaModule) -> Result<Vec<libbpf_rs::Link>> {
+    // Attach whichever entry points survived dynamic/static linking. Keeping
+    // this in one place makes the entry/return pairing explicit.
+    let offs = module.offsets;
+    let mut links = Vec::new();
     let prog_entry = &skel.progs.handle_entry_lua;
     if offs.lua_resume != 0 {
         links.push(prog_entry.attach_uprobe(false, -1, &module.path, offs.lua_resume as usize)?);
@@ -263,14 +300,7 @@ fn main() -> Result<()> {
             offs.lua_callk as usize,
         )?);
     }
-    if offs.lua_yieldk != 0 {
-        links.push(skel.progs.handle_return_lua.attach_uprobe(
-            true,
-            -1,
-            &module.path,
-            offs.lua_yieldk as usize,
-        )?);
-    }
+
     if links.is_empty() {
         bail!(
             "no Lua entry-point uprobes were attached (expected at least one of \
@@ -278,215 +308,206 @@ fn main() -> Result<()> {
             module.path.display()
         );
     }
+    Ok(links)
+}
 
+fn attach_perf_events(skel: &ProfileSkel<'_>, frequency: u64) -> Result<Vec<libbpf_rs::Link>> {
     let nr_cpus = libbpf_rs::num_possible_cpus()?;
-    let mut perf_links: Vec<libbpf_rs::Link> = Vec::new();
+    let mut links = Vec::with_capacity(nr_cpus);
     for cpu in 0..nr_cpus as i32 {
-        let fd = perf::open_cpu_clock(args.frequency, cpu, include_native_stacks)?;
-        perf_links.push(skel.progs.do_perf_event.attach_perf_event(fd)?);
+        let fd = perf::open_cpu_clock(frequency, cpu)?;
+        links.push(skel.progs.do_perf_event.attach_perf_event(fd)?);
     }
+    Ok(links)
+}
 
-    let pending = Arc::new(Mutex::new(Pending::default()));
-    let p1 = pending.clone();
-    let p2 = pending.clone();
-    let p3 = pending.clone();
-    let p4 = pending.clone();
+fn build_perf_buffers<'skel>(
+    skel: &'skel ProfileSkel<'_>,
+    pending: &Arc<Mutex<Pending>>,
+    user_unwinder: Option<UserUnwinder>,
+    include_native_stacks: bool,
+) -> Result<(PerfBuffer<'skel>, PerfBuffer<'skel>)> {
+    let native_samples = pending.clone();
+    let lua_samples = pending.clone();
+    let native_loss = pending.clone();
+    let lua_loss = pending.clone();
     let mut callback_unwinder = user_unwinder;
 
-    let pb_native: PerfBuffer = PerfBufferBuilder::new(&skel.maps.native_events)
+    let native = PerfBufferBuilder::new(&skel.maps.native_events)
         .pages(64)
         .sample_cb(move |_cpu, data: &[u8]| {
-            if let Some(ne) = native_event_from_bytes(data) {
-                handle_native(&ne, &p1, callback_unwinder.as_mut(), include_native_stacks);
+            if let Some(event) = native_event_from_bytes(data) {
+                handle_native(
+                    &event,
+                    &native_samples,
+                    callback_unwinder.as_mut(),
+                    include_native_stacks,
+                );
             }
         })
         .lost_cb(move |_cpu, count| {
-            // Sample loss on the native channel means that sample's whole
-            // (native, Lua) pair is gone — the Lua half can't be correlated
-            // without the seq key, so any later-arriving Lua events for the
-            // same seq become orphans and are drained at shutdown.
-            p3.lock().unwrap().lost.native += count;
+            native_loss.lock().unwrap().lost.native += count;
         })
         .build()?;
 
-    let pb_lua: PerfBuffer = PerfBufferBuilder::new(&skel.maps.lua_events_out)
+    let lua = PerfBufferBuilder::new(&skel.maps.lua_events_out)
         .pages(64)
         .sample_cb(move |_cpu, data: &[u8]| {
-            if let Some(le) = from_bytes_aligned::<LuaStackEvent>(data) {
-                handle_lua(le, &p2);
+            if let Some(event) = from_bytes_aligned::<LuaStackEvent>(data) {
+                handle_lua(event, &lua_samples);
             }
         })
         .lost_cb(move |_cpu, count| {
-            // Lua-side loss leaves a native sample with no Lua frames — it
-            // still folds against the native stack, so the flame graph is
-            // merely incomplete on the Lua side, not corrupted.
-            p4.lock().unwrap().lost.lua += count;
+            lua_loss.lock().unwrap().lost.lua += count;
         })
         .build()?;
 
+    Ok((native, lua))
+}
+
+struct SampleProcessor {
+    pending: Arc<Mutex<Pending>>,
+    resolver: Option<LineResolver>,
+    source: Source<'static>,
+    symbolizer: Symbolizer,
+    include_native_stacks: bool,
+}
+
+impl SampleProcessor {
+    fn new(
+        pending: Arc<Mutex<Pending>>,
+        pid: i32,
+        version: LuaVersion,
+        include_native_stacks: bool,
+    ) -> Self {
+        // Resolve Proto->lineinfo while sampled Proto pointers are still live.
+        let resolver = LineResolver::new(pid, ProtoLayout::for_version(version))
+            .map_err(|error| {
+                eprintln!(
+                    "[!] line resolver unavailable: {error}; Lua lines will fall back to linedefined"
+                );
+                error
+            })
+            .ok();
+        let source = Source::Process(Process {
+            pid: (pid as u32).into(),
+            debug_syms: true,
+            perf_map: false,
+            map_files: false,
+            vdso: false,
+            _non_exhaustive: (),
+        });
+        Self {
+            pending,
+            resolver,
+            source,
+            symbolizer: Symbolizer::new(),
+            include_native_stacks,
+        }
+    }
+
+    fn fold_ready(&mut self) {
+        process_ready_samples(
+            &self.pending,
+            self.resolver.as_mut(),
+            &self.source,
+            &self.symbolizer,
+            self.include_native_stacks,
+        );
+        // Bound memory when the native perf buffer loses a sample counterpart.
+        drain_lua_orphans(
+            &self.pending,
+            self.resolver.as_mut(),
+            &self.source,
+            &self.symbolizer,
+            self.include_native_stacks,
+        );
+    }
+
+    fn process_cycle(&mut self) {
+        self.fold_ready();
+        advance_watermarks(&self.pending);
+    }
+
+    fn finish(&mut self) {
+        // Two passes promote and then consume records from the final poll.
+        advance_watermarks(&self.pending);
+        self.fold_ready();
+        advance_watermarks(&self.pending);
+        self.fold_ready();
+    }
+
+    fn take_folded(&self) -> HashMap<String, u64> {
+        let mut pending = self.pending.lock().unwrap();
+        if self.include_native_stacks {
+            println!(
+                "[+] user-space DWARF unwind: {} succeeded, {} fell back, {} snapshots exhausted, {} hit the {}-frame limit",
+                pending.unwind_stats.succeeded,
+                pending.unwind_stats.fallback,
+                pending.unwind_stats.snapshot_truncated,
+                pending.unwind_stats.depth_limited,
+                types::PERF_MAX_STACK_DEPTH
+            );
+        }
+        if pending.lost.native != 0 || pending.lost.lua != 0 {
+            eprintln!(
+                "[!] perf-buffer records lost: native={}, lua={} \
+                 (consider lowering --frequency)",
+                pending.lost.native, pending.lost.lua
+            );
+        }
+        std::mem::take(&mut pending.folded)
+    }
+}
+
+fn capture_samples(
+    native: &PerfBuffer,
+    lua: &PerfBuffer,
+    frequency: u64,
+    duration: u64,
+    processor: &mut SampleProcessor,
+) -> Result<()> {
     println!(
         "[+] sampling at {} Hz for {} ...",
-        args.frequency,
-        if args.duration == 0 {
+        frequency,
+        if duration == 0 {
             "ever".into()
         } else {
-            format!("{}s", args.duration)
+            format!("{duration}s")
         }
     );
     install_ctrlc();
     let start = std::time::Instant::now();
-
-    // Symbolizer / resolver are constructed up front so samples can be folded
-    // *incrementally* during the poll loop, not all at once at shutdown.
-    // Resolving Proto->lineinfo while the target's Proto* is still live is
-    // what makes long-running captures safe — by the time shutdown processes
-    // anything, a sample has already been folded (delay ≤ one poll cycle,
-    // ~100ms).
-    let src = Source::Process(Process {
-        pid: (args.pid as u32).into(),
-        debug_syms: true,
-        perf_map: false,
-        map_files: false,
-        vdso: false,
-        _non_exhaustive: (),
-    });
-    let sym = Symbolizer::new();
-    let mut resolver = LineResolver::new(args.pid, ProtoLayout::for_version(module.version))
-        .map_err(|e| {
-            eprintln!(
-                "[!] line resolver unavailable: {e}; Lua lines will fall back to linedefined"
-            );
-            e
-        })
-        .ok();
-
-    let poll_err: Option<anyhow::Error> = {
-        let mut e: Option<anyhow::Error> = None;
-        while !EXITING.load(Ordering::SeqCst) {
-            // Surface poll errors instead of swallowing them: a perf-buffer
-            // failure (e.g. mmap corruption, fd closed underneath us) would
-            // otherwise leave the run silently producing no data. We record
-            // the first error and break to the drain path so partial results
-            // are still emitted; the error is then propagated.
-            if let Err(err) = pb_native.poll(Duration::from_millis(100)) {
-                e = Some(anyhow!("native perf-buffer poll failed: {err}"));
-                break;
-            }
-            if let Err(err) = pb_lua.poll(Duration::from_millis(100)) {
-                e = Some(anyhow!("lua perf-buffer poll failed: {err}"));
-                break;
-            }
-            process_ready_samples(
-                &pending,
-                resolver.as_mut(),
-                &src,
-                &sym,
-                include_native_stacks,
-            );
-            // Drain Lua orphans (native half lost on the perf buffer) every
-            // cycle, not just at shutdown — otherwise a `--duration 0` run
-            // under sustained native-channel loss would accumulate them
-            // without bound.
-            drain_lua_orphans(
-                &pending,
-                resolver.as_mut(),
-                &src,
-                &sym,
-                include_native_stacks,
-            );
-            advance_watermarks(&pending);
-            if args.duration > 0 && start.elapsed() >= Duration::from_secs(args.duration) {
-                break;
-            }
+    while !EXITING.load(Ordering::SeqCst) {
+        native
+            .poll(Duration::from_millis(100))
+            .map_err(|error| anyhow!("native perf-buffer poll failed: {error}"))?;
+        lua.poll(Duration::from_millis(100))
+            .map_err(|error| anyhow!("lua perf-buffer poll failed: {error}"))?;
+        processor.process_cycle();
+        if duration > 0 && start.elapsed() >= Duration::from_secs(duration) {
+            break;
         }
-        e
-    };
-    drop(pb_native);
-    drop(pb_lua);
-
-    // Drain anything still in flight. Two passes: the first promotes this
-    // cycle's just_arrived markers (so anything from the very last poll is
-    // now eligible); the second folds whatever remains. process_ready_samples
-    // and drain_lua_orphans are both idempotent on an empty Pending.
-    advance_watermarks(&pending);
-    process_ready_samples(
-        &pending,
-        resolver.as_mut(),
-        &src,
-        &sym,
-        include_native_stacks,
-    );
-    drain_lua_orphans(
-        &pending,
-        resolver.as_mut(),
-        &src,
-        &sym,
-        include_native_stacks,
-    );
-    advance_watermarks(&pending);
-    process_ready_samples(
-        &pending,
-        resolver.as_mut(),
-        &src,
-        &sym,
-        include_native_stacks,
-    );
-    // A Lua event can still arrive without a native counterpart if the perf
-    // buffer dropped the native half — fold whatever Lua stragglers remain
-    // against an empty native stack so they're not silently lost.
-    drain_lua_orphans(
-        &pending,
-        resolver.as_mut(),
-        &src,
-        &sym,
-        include_native_stacks,
-    );
-
-    let folded = {
-        let mut g = pending.lock().unwrap();
-        if include_native_stacks {
-            println!(
-                "[+] user-space DWARF unwind: {} succeeded, {} fell back, {} snapshots exhausted, {} hit the {}-frame limit",
-                g.unwind_stats.succeeded,
-                g.unwind_stats.fallback,
-                g.unwind_stats.snapshot_truncated,
-                g.unwind_stats.depth_limited,
-                types::PERF_MAX_STACK_DEPTH
-            );
-        }
-        // Always surface perf-buffer loss, even in Lua-only mode: a non-zero
-        // count means the flame graph is missing samples. The two channels
-        // degrade differently — native loss produces orphan Lua events
-        // (folded at shutdown against an empty native stack); Lua loss
-        // leaves a native sample with no Lua frames.
-        if g.lost.native != 0 || g.lost.lua != 0 {
-            // Counts are perf-buffer record counts, not full samples: native
-            // loss = whole sample pairs gone (the seq key never arrives);
-            // Lua loss = that sample still folds, minus its Lua frames.
-            eprintln!(
-                "[!] perf-buffer records lost: native={}, lua={} \
-                 (consider lowering --frequency)",
-                g.lost.native, g.lost.lua
-            );
-        }
-        std::mem::take(&mut g.folded)
-    };
-
-    write_folded(&folded, std::path::Path::new(&args.output))?;
-    let svg = std::path::Path::new(&args.output).with_extension("svg");
-    let title = if args.include_c_stacks {
-        format!("lua-flame-rs (C + Lua {})", module.version.as_str())
-    } else {
-        format!("lua-flame-rs (Lua {} only)", module.version.as_str())
-    };
-    match make_svg(std::path::Path::new(&args.output), &svg, &title) {
-        Ok(()) => println!("[+] flame graph SVG: {}", svg.display()),
-        Err(e) => println!("[!] SVG generation failed: {e}"),
     }
-    drop(links);
-    drop(perf_links);
-    if let Some(e) = poll_err {
-        return Err(e);
+    Ok(())
+}
+
+fn write_capture_outputs(
+    folded: &HashMap<String, u64>,
+    output: &std::path::Path,
+    version: LuaVersion,
+    include_native_stacks: bool,
+) -> Result<()> {
+    write_folded(folded, output)?;
+    let svg = output.with_extension("svg");
+    let title = if include_native_stacks {
+        format!("lua-flame-rs (C + Lua {})", version.as_str())
+    } else {
+        format!("lua-flame-rs (Lua {} only)", version.as_str())
+    };
+    match make_svg(output, &svg, &title) {
+        Ok(()) => println!("[+] flame graph SVG: {}", svg.display()),
+        Err(error) => println!("[!] SVG generation failed: {error}"),
     }
     Ok(())
 }
@@ -774,8 +795,8 @@ fn format_lua_frame(ev: &LuaStackEvent, include_c_stacks: bool) -> Option<String
             }
         }
         FUNC_TYPE_C | FUNC_TYPE_LCF => {
-            // Belt-and-suspenders: BPF already drops these when
-            // lua_frames_only is set. If one slips through (stale binary,
+            // Belt-and-suspenders: BPF already drops these when native stack
+            // collection is disabled. If one slips through (stale binary,
             // partial reload, etc.) honour the user's --include-c-stacks
             // choice here too.
             if include_c_stacks {
@@ -1031,8 +1052,8 @@ mod tests {
     fn lua_only_mode_drops_c_and_lcf_frames() {
         // Regression: without --include-c-stacks, FUNC_TYPE_C and
         // FUNC_TYPE_LCF events must NOT appear in the folded stack. Catches
-        // both the BPF source-filter flag (lua_frames_only) and the
-        // belt-and-suspenders user-space filter in format_lua_frame.
+        // both the BPF collect_native_stacks gate and the belt-and-suspenders
+        // user-space filter in format_lua_frame.
         let c = LuaStackEvent {
             r#type: FUNC_TYPE_C,
             funcp: 0x1234,
@@ -1075,7 +1096,6 @@ mod tests {
         assert_eq!(w.ci_savedpc, 32);
         assert_eq!(w.ci_callstatus, 62);
         assert_eq!(w.callstatus_mask, 0xffff);
-        assert_eq!(w.proto_code, 64);
         assert_eq!(w.proto_linedefined, 44);
         assert_eq!(w.proto_source, 112);
     }
@@ -1085,7 +1105,6 @@ mod tests {
         let w = walker_offsets(LuaVersion::Lua53);
         assert_eq!(w.ci_savedpc, 40);
         assert_eq!(w.ci_callstatus, 66);
-        assert_eq!(w.proto_code, 56);
         assert_eq!(w.proto_linedefined, 40);
         assert_eq!(w.proto_source, 104);
         // 5.3 uses CIST_LUA (bit 1) set => Lua frame — same semantics as
@@ -1104,7 +1123,6 @@ mod tests {
                                              // 5.4's CIST_C).
         assert_eq!(w.lua_frame_mask, 0x1);
         assert_eq!(w.lua_frame_when_set, 1);
-        assert_eq!(w.proto_code, 24);
         assert_eq!(w.proto_linedefined, 104);
         assert_eq!(w.proto_source, 72);
     }
@@ -1221,7 +1239,7 @@ mod tests {
         // End-to-end: a sample whose CallInfo walk would have produced a
         // C-frame event (FUNC_TYPE_C) must not leak into a Lua-only folded
         // stack through process_ready_samples. (BPF already filters these
-        // via lua_frames_only; this is the user-space backstop.)
+        // via collect_native_stacks; this is the user-space backstop.)
         let pending = Mutex::new(Pending::default());
         let key = SampleKey {
             pid: 1,

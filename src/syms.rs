@@ -53,7 +53,6 @@ pub struct LuaOffsets {
     pub lua_resume: u64,
     pub lua_pcallk: u64,
     pub lua_callk: u64,
-    pub lua_yieldk: u64,
 }
 
 pub struct LuaModule {
@@ -141,7 +140,6 @@ struct LuaSymbols {
     lua_resume: Option<u64>,
     lua_pcallk: Option<u64>,
     lua_callk: Option<u64>,
-    lua_yieldk: Option<u64>,
     is_luajit: bool,
     has_v54_sentinel: bool,
     has_v53_sentinel: bool,
@@ -172,7 +170,6 @@ fn scan_lua_symbols(path: &Path) -> Result<LuaSymbols> {
         assign!(lua_resume);
         assign!(lua_pcallk);
         assign!(lua_callk);
-        assign!(lua_yieldk);
         match name {
             // LuaJIT: reject up front, its internals are entirely different.
             b"luaJIT_setmode" => out.is_luajit = true,
@@ -228,7 +225,6 @@ fn module_from_path(path: &Path, forced_version: Option<LuaVersion>) -> Result<L
             lua_resume: syms.lua_resume.unwrap_or(0),
             lua_pcallk: syms.lua_pcallk.unwrap_or(0),
             lua_callk: syms.lua_callk.unwrap_or(0),
-            lua_yieldk: syms.lua_yieldk.unwrap_or(0),
         },
     })
 }

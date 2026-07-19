@@ -33,14 +33,9 @@
         _v;                                                                                                            \
     })
 
-/* read into a caller-provided buffer */
-#define LUARD(dst, src, field) bpf_probe_read_user(dst, sizeof(*(dst)), (const void *)&(src)->field)
-
-/* read `sizeof(*dst)` bytes from (base + off) — the version-parameterised
- * equivalent of LUARD, used for fields that live at different offsets per
- * Lua version (savedpc, callstatus, proto fields, ...). */
-#define LUARD_OFF(dst, base, off)                                                                                      \
-    bpf_probe_read_user(dst, sizeof(*(dst)), (const void *)((const char *)(base) + (off)))
+/* Read `sizeof(*dst)` bytes from (base + off), used for fields that live at
+ * different offsets per Lua version (savedpc, callstatus, proto fields, ...). */
+#define LUARD_OFF(dst, base, off) bpf_probe_read_user(dst, sizeof(*(dst)), (const void *)((const char *)(base) + (off)))
 
 /* ---- scalar typedefs -------------------------------------------------- */
 typedef unsigned char lu_byte;
@@ -65,9 +60,9 @@ typedef struct TValue {
 typedef TValue StackValue;
 
 /* CommonHeader for all GCObjects, inlined into each struct. */
-#define COMMON_HEADER \
-    struct GCObject *next; \
-    lu_byte tt; \
+#define COMMON_HEADER                                                                                                  \
+    struct GCObject *next;                                                                                             \
+    lu_byte tt;                                                                                                        \
     lu_byte marked
 
 /* ---- TString ---------------------------------------------------------- *
@@ -85,8 +80,6 @@ typedef struct TString {
     } u;
     char contents[1];
 } TString;
-
-#define getstr(ts) ((const char *)((ts)->contents))
 
 /* ---- Closures --------------------------------------------------------- *
  * 5.2 / 5.3 / 5.4 share the closure prefix: COMMON_HEADER(10) + nupvalues(1)
@@ -121,10 +114,9 @@ typedef struct CallInfo {
 
 /* ---- type tags (collectable form, with BIT_ISCOLLECTABLE=0x40) -------- *
  * These tag values are the same in 5.2 / 5.3 / 5.4 (lobject.h). */
-#define LUA_VLCL      0x6  /* Lua closure */
-#define LUA_VLCF      0x16 /* light C function (NOT collectable) */
-#define LUA_VCCL      0x26 /* C closure */
-#define LUA_TFUNCTION 6
+#define LUA_VLCL          0x6  /* Lua closure */
+#define LUA_VLCF          0x16 /* light C function (NOT collectable) */
+#define LUA_VCCL          0x26 /* C closure */
 #define BIT_ISCOLLECTABLE (1u << 6)
 
 static __always_inline bool valid_user_ptr(uint64_t ptr)

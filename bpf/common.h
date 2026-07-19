@@ -1,7 +1,6 @@
 #ifndef __COMMON_H
 #define __COMMON_H
 
-#define TASK_COMM_LEN                  16
 #define MAX_ENTRIES                    10240
 #define CHUNKNAME_LEN                  128
 #define MAX_LUA_DEPTH                  32
@@ -44,8 +43,8 @@ struct lua_stack_event {
     unsigned long long funcp; /* C function address (FUNC_TYPE_C / FUNC_TYPE_LCF) */
     int line;                 /* source line (resolved in user space for LUA frames) */
     /* raw inputs for user-space line resolution (Lua frames only) */
-    unsigned long long proto;     /* Proto* */
-    unsigned long long savedpc;   /* Instruction* */
+    unsigned long long proto;   /* Proto* */
+    unsigned long long savedpc; /* Instruction* */
     int linedefined;
 };
 

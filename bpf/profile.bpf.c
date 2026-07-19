@@ -20,28 +20,22 @@
 #include "lua_state.h"
 #include "common.h"
 
+/* Also controls whether C closures and light C functions are emitted. */
 const volatile bool collect_native_stacks = false;
-const volatile bool include_idle = false;
-/* When true, only Lua frames are emitted from the CallInfo walk; C closures
- * and light C functions are dropped at the source. Set from user space to
- * match --include-c-stacks (negated). */
-const volatile bool lua_frames_only = true;
 const volatile pid_t targ_pid = -1;
-const volatile pid_t targ_tid = -1;
 
 /* ---- version-dependent Lua offsets (set from user space) -------------- *
  * Defaults target Lua 5.4 (default ABI on Linux x86_64 / aarch64); user
  * space overrides all of them with the right table for the detected
  * version. See walker_offsets() in src/main.rs. */
-const volatile u32 loff_state_ci = 32;           /* offsetof(lua_State, ci) */
-const volatile u32 loff_ci_savedpc = 32;         /* CallInfo.u.l.savedpc / l.savedpc */
-const volatile u32 loff_ci_callstatus = 62;      /* CallInfo.callstatus (u16 in 5.3/5.4, u8 in 5.2) */
-const volatile u32 loff_callstatus_mask = 0xffff;/* width mask: u16 -> 0xffff, u8 -> 0xff */
-const volatile u32 loff_lua_frame_mask = 0x2;    /* CIST_C (5.4) / CIST_LUA (5.3, bit 1) / CIST_LUA (5.2, bit 0) */
+const volatile u32 loff_state_ci = 32;            /* offsetof(lua_State, ci) */
+const volatile u32 loff_ci_savedpc = 32;          /* CallInfo.u.l.savedpc / l.savedpc */
+const volatile u32 loff_ci_callstatus = 62;       /* CallInfo.callstatus (u16 in 5.3/5.4, u8 in 5.2) */
+const volatile u32 loff_callstatus_mask = 0xffff; /* width mask: u16 -> 0xffff, u8 -> 0xff */
+const volatile u32 loff_lua_frame_mask = 0x2;     /* CIST_C (5.4) / CIST_LUA (5.3, bit 1) / CIST_LUA (5.2, bit 0) */
 /* 0 => a SET bit means a C frame (5.4 only: CIST_C set => C frame).
  * 1 => a SET bit means a Lua frame (5.3 / 5.2: CIST_LUA set => Lua frame). */
 const volatile u32 loff_lua_frame_when_set = 0;
-const volatile u32 loff_proto_code = 64;
 const volatile u32 loff_proto_linedefined = 44;
 const volatile u32 loff_proto_source = 112;
 
@@ -98,7 +92,8 @@ struct {
  */
 
 /* emit one lua frame */
-static __always_inline void emit_lua(struct bpf_perf_event_data *ctx, CallInfo *ci, u32 pid, u32 tid, u32 seq, int level)
+static __always_inline void emit_lua(struct bpf_perf_event_data *ctx, CallInfo *ci, u32 pid, u32 tid, u32 seq,
+                                     int level)
 {
     StackValue *func_slot = LUARD_T(ci, func, StackValue *);
     if (!valid_user_ptr((uint64_t)func_slot)) {
@@ -148,7 +143,7 @@ static __always_inline void emit_lua(struct bpf_perf_event_data *ctx, CallInfo *
         /* In Lua-only mode, drop C closures and light C functions at the
          * source — user space never sees them, the perf buffer never
          * carries them, and the folded stack stays pure-Lua. */
-        if (lua_frames_only) {
+        if (!collect_native_stacks) {
             return;
         }
         /* C closure or light C function. Match each known tag explicitly
@@ -180,19 +175,15 @@ static __always_inline void emit_lua(struct bpf_perf_event_data *ctx, CallInfo *
     e->type = FUNC_TYPE_LUA;
     e->proto = (uint64_t)pt;
 
-    /* linedefined, code, source: read at version-dependent offsets. */
+    /* linedefined and source live at version-dependent offsets. */
     int linedefined = 0;
     LUARD_OFF(&linedefined, pt, loff_proto_linedefined);
     e->linedefined = linedefined;
 
-    uint64_t code_ptr = 0;
-    LUARD_OFF(&code_ptr, pt, loff_proto_code);
-
-    /* savedpc is an Instruction* into pt->code. We forward both to user
-     * space, which divides by 4 (INSTRUCTION_SIZE) to get a pc index. */
+    /* User space reads Proto->code and validates savedpc against it. */
     const Instruction *savedpc = NULL;
     LUARD_OFF(&savedpc, ci, loff_ci_savedpc);
-    if (valid_user_ptr((uint64_t)savedpc) && valid_user_ptr(code_ptr) && (uint64_t)savedpc >= code_ptr) {
+    if (valid_user_ptr((uint64_t)savedpc)) {
         e->savedpc = (uint64_t)savedpc;
     }
 
@@ -304,13 +295,7 @@ int do_perf_event(struct bpf_perf_event_data *ctx)
 {
     u32 pid, tid;
     get_pid_tid(&pid, &tid);
-    if (!include_idle && tid == 0) {
-        return 0;
-    }
     if (targ_pid != -1 && targ_pid != pid) {
-        return 0;
-    }
-    if (targ_tid != -1 && targ_tid != tid) {
         return 0;
     }
 
